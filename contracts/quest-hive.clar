@@ -185,6 +185,30 @@
   )
 )
 
+;; Update user profile with new streak information
+(define-private (update-user-profile-streak (user principal) (current-quest-streak uint))
+  (let (
+    (profile (default-to 
+      { reputation: u0, total-quests-completed: u0, longest-streak: u0, current-streak: u0, last-active: u0 }
+      (map-get? user-profiles { user: user })
+    ))
+    (new-longest-streak (if (> current-quest-streak (get longest-streak profile))
+                           current-quest-streak
+                           (get longest-streak profile)))
+  )
+    (map-set user-profiles
+      { user: user }
+      {
+        reputation: (get reputation profile),
+        total-quests-completed: (get total-quests-completed profile),
+        longest-streak: new-longest-streak,
+        current-streak: (+ (get current-streak profile) u1),
+        last-active: (unwrap-panic (get-block-info? time u0))
+      }
+    )
+  )
+)
+
 ;; Update user streak for a quest
 (define-private (update-quest-streak (quest-id uint) (user principal))
   (let (
@@ -229,30 +253,6 @@
   )
 )
 
-;; Update user profile with new streak information
-(define-private (update-user-profile-streak (user principal) (current-quest-streak uint))
-  (let (
-    (profile (default-to 
-      { reputation: u0, total-quests-completed: u0, longest-streak: u0, current-streak: u0, last-active: u0 }
-      (map-get? user-profiles { user: user })
-    ))
-    (new-longest-streak (if (> current-quest-streak (get longest-streak profile))
-                           current-quest-streak
-                           (get longest-streak profile)))
-  )
-    (map-set user-profiles
-      { user: user }
-      {
-        reputation: (get reputation profile),
-        total-quests-completed: (get total-quests-completed profile),
-        longest-streak: new-longest-streak,
-        current-streak: (+ (get current-streak profile) u1),
-        last-active: (unwrap-panic (get-block-info? time u0))
-      }
-    )
-  )
-)
-
 ;; Validate frequency value
 (define-private (is-valid-frequency (frequency uint))
   (or
@@ -272,11 +272,94 @@
   )
 )
 
+;; Helper to find user index in leaderboard entries
+(define-private (find-user-index (entries (list 100 { user: principal, score: uint, streak: uint })) (target-user principal) (current-index uint))
+  (get result
+    (fold find-user-index-fold 
+      entries
+      {
+        target-user: target-user,
+        current-index: u0,
+        found-index: none,
+        result: none
+      }
+    )
+  )
+)
+
+;; Helper for find-user-index using fold
+(define-private (find-user-index-fold 
+  (entry { user: principal, score: uint, streak: uint }) 
+  (state { target-user: principal, current-index: uint, found-index: (optional uint), result: (optional uint) })
+)
+  (if (is-some (get result state))
+    ;; Already found, just return
+    state
+    (if (is-eq (get user entry) (get target-user state))
+      ;; Found match, record it
+      (merge state { 
+        found-index: (some (get current-index state)),
+        result: (some (get current-index state))
+      })
+      ;; No match, increment index and continue
+      (merge state { current-index: (+ (get current-index state) u1) })
+    )
+  )
+)
+
+;; Helper function to update an entry at a specific index using fold
+(define-private (update-entry-at-index 
+  (entry { user: principal, score: uint, streak: uint })
+  (state { 
+    entries: (list 100 { user: principal, score: uint, streak: uint }),
+    target-index: uint,
+    current-index: uint,
+    new-entry: { user: principal, score: uint, streak: uint }
+  })
+)
+  (let (
+    (is-target (is-eq (get current-index state) (get target-index state)))
+    (current-entries (get entries state))
+    (updated-entry (if is-target
+                     (merge entry {
+                       score: (+ (get score entry) (get score (get new-entry state))),
+                       streak: (get streak (get new-entry state))
+                     })
+                     entry))
+  )
+    (merge state {
+      entries: (unwrap-panic (as-max-len? (append current-entries updated-entry) u100)),
+      current-index: (+ (get current-index state) u1)
+    })
+  )
+)
+
+;; Update or add user entry in the leaderboard list
+(define-private (update-leaderboard-entry (entries (list 100 { user: principal, score: uint, streak: uint })) (new-entry { user: principal, score: uint, streak: uint }))
+  (let (
+    (user-index (find-user-index entries (get user new-entry) u0))
+  )
+    (if (is-some user-index)
+      ;; Update existing entry by creating a new list with the updated entry
+      (get entries (fold update-entry-at-index 
+        entries
+        { 
+          entries: (list), 
+          target-index: (unwrap-panic user-index),
+          current-index: u0,
+          new-entry: new-entry
+        }))
+      ;; Add new entry if not found
+      (unwrap-panic (as-max-len? (append entries new-entry) u100))
+    )
+  )
+)
+
 ;; Update challenge leaderboard after quest completion
 (define-private (update-challenge-leaderboard (challenge-id uint) (user principal))
   (let (
     (challenge (unwrap! (map-get? community-challenges { challenge-id: challenge-id }) false))
-    (is-participant (default-to false (some (index-of? (get participants challenge) user))))
+    (is-participant (contains-principal (get participants challenge) user))
     (current-leaderboard (default-to { user-scores: (list) } (map-get? challenge-leaderboards { challenge-id: challenge-id })))
     (user-streak-info (default-to 
                         { current-streak: u0, longest-streak: u0, last-completion-date: u0 }
@@ -289,41 +372,6 @@
         { user-scores: (update-leaderboard-entry (get user-scores current-leaderboard) user-entry) }
       )
       false
-    )
-  )
-)
-
-;; Update or add user entry in the leaderboard list
-(define-private (update-leaderboard-entry (entries (list 100 { user: principal, score: uint, streak: uint })) (new-entry { user: principal, score: uint, streak: uint }))
-  (let (
-    (user-index (find-user-index entries (get user new-entry) u0))
-  )
-    (if (is-some user-index)
-      (let (
-        (existing-entry (unwrap-panic (element-at entries (unwrap-panic user-index))))
-        (updated-entry { 
-          user: (get user existing-entry), 
-          score: (+ (get score existing-entry) (get score new-entry)),
-          streak: (get streak new-entry)
-        })
-      )
-        (replace-at entries (unwrap-panic user-index) updated-entry)
-      )
-      ;; Add new entry if not found
-      (unwrap-panic (as-max-len? (append entries new-entry) u100))
-    )
-  )
-)
-
-;; Helper to find user index in leaderboard entries
-(define-private (find-user-index (entries (list 100 { user: principal, score: uint, streak: uint })) (target-user principal) (current-index uint))
-  (if (>= current-index (len entries))
-    none
-    (let ((entry (unwrap-panic (element-at entries current-index))))
-      (if (is-eq (get user entry) target-user)
-        (some current-index)
-        (find-user-index entries target-user (+ current-index u1))
-      )
     )
   )
 )
@@ -379,7 +427,37 @@
 ;; Check if user is participant in challenge
 (define-read-only (is-challenge-participant (challenge-id uint) (user principal))
   (let ((challenge (unwrap! (map-get? community-challenges { challenge-id: challenge-id }) false)))
-    (default-to false (some (index-of? (get participants challenge) user)))
+    (contains-principal (get participants challenge) user)
+  )
+)
+
+;; Helper function to check if a list of principals contains a specific principal
+(define-private (contains-principal (principals (list 100 principal)) (target principal))
+  (is-some (get result
+    (fold check-principal-fold 
+      principals
+      { 
+        found: false, 
+        target: target,
+        result: none
+      })
+  ))
+)
+
+;; Helper for contains-principal
+(define-private (check-principal-fold 
+  (current-principal principal) 
+  (state { found: bool, target: principal, result: (optional bool) })
+)
+  (if (get found state)
+    ;; Already found, just return state
+    state
+    (if (is-eq current-principal (get target state))
+      ;; Found match
+      (merge state { found: true, result: (some true) })
+      ;; No match, continue checking
+      state
+    )
   )
 )
 
@@ -656,7 +734,8 @@
     )
     
     ;; Creator automatically joins their own challenge
-    (create-quest-from-template quest-template-id)
+    ;; We're not checking the response but it should succeed since we already verified the template exists
+    (try! (create-quest-from-template quest-template-id))
     
     (ok new-challenge-id)
   )
@@ -666,7 +745,7 @@
 (define-public (join-challenge (challenge-id uint))
   (let (
     (challenge (unwrap! (map-get? community-challenges { challenge-id: challenge-id }) ERR-CHALLENGE-NOT-FOUND))
-    (is-participant (default-to false (some (index-of? (get participants challenge) tx-sender))))
+    (is-participant (contains-principal (get participants challenge) tx-sender))
     (current-time (unwrap-panic (get-block-info? time u0)))
     (current-date (/ current-time (* u60 u60 u24)))
   )
